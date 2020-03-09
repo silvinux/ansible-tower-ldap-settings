@@ -3,6 +3,9 @@
 
 # (c) 2017, Stanley Karunditu <skarundi@redhat.com>
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# (ɔ) 2020, Silvio Perez Torres <silvio@redhat.com>
+# Added freeipa provider and changed to TowerModule.
+
 
 from __future__ import absolute_import, division, print_function
 __metaclass__ = type
@@ -66,6 +69,7 @@ options:
             - Specify the type of LDAP database to be used.
             - The C(active_directory) option will set the I(AUTH_LDAP_GROUP_TYPE) Tower setting attribute to I(NestedActiveDirectoryGroupType)
             - The  C(open_ldap) option will set the I(AUTH_LDAP_GROUP_TYPE) Tower setting attribute to  I(NestedGroupOfNamesType)
+            - The  C(freeipa) option will set the I(AUTH_LDAP_GROUP_TYPE) Tower setting attribute to  I(NestedMemberDNGroupType)
             - The default setting is C(active_directory)
         choices: ['"active_directory"', "open_ldap"]
         default: "active_directory"
@@ -170,7 +174,7 @@ EXAMPLES = '''
 
 '''
 
-from ansible.module_utils.ansible_tower import tower_argument_spec, tower_auth_config, tower_check_mode,HAS_TOWER_CLI
+from ansible.module_utils.ansible_tower import TowerModule, tower_auth_config, tower_check_mode,HAS_TOWER_CLI
 
 try:
     import tower_cli
@@ -287,6 +291,14 @@ def modify_ldap_config(module, check_mode=False):
                             module.params.get('ldap_group_type')
                         ), cls=FixBoolValuesEncoder))
                 module.changed_values.append(_ldap_attr)
+            elif _ldap_attr == 'ldap_group_search':
+                if not check_mode:
+                    module.tower_settings.modify('AUTH_LDAP_GROUP_SEARCH',
+                        json.dumps(transform_ldap_group_search(
+                            module.params.get(_ldap_attr),
+                            module.params.get('ldap_group_type')
+                        ), cls=FixBoolValuesEncoder))
+                module.changed_values.append(_ldap_attr)
             else:
                 real_ldap_attr = "AUTH_%s" % _ldap_attr.upper()
                 if not check_mode:
@@ -326,27 +338,24 @@ def get_ldap_values(module):
     current_settings['ldap_start_tls'] = tower_settings.get('AUTH_LDAP_START_TLS').get('value')
     current_settings['ldap_user_attr_map'] = tower_settings.get('AUTH_LDAP_USER_ATTR_MAP').get('value')
 
-    group_search = tower_settings.get('AUTH_LDAP_GROUP_SEARCH').get('value')
-    current_settings['ldap_group_search'] = transform_ldap_group_search(group_search)
-
     group_type_from_tower = tower_settings.get('AUTH_LDAP_GROUP_TYPE').get('value')
     group_type = transform_ldap_group_type(group_type_from_tower)
     current_settings['ldap_group_type'] = group_type
 
+    group_search = tower_settings.get('AUTH_LDAP_GROUP_SEARCH').get('value')
+    current_settings['ldap_group_search'] = transform_ldap_group_search(group_search, group_type)
 
     user_search = tower_settings.get('AUTH_LDAP_USER_SEARCH').get('value')
     current_settings['ldap_user_search'] = transform_ldap_user_search(user_search, group_type)
+
     ldap_user_flags = tower_settings.get('AUTH_LDAP_USER_FLAGS_BY_GROUP').get('value')
     current_settings['ldap_superuser']= transform_ldap_user_flags_by_group(ldap_user_flags)
 
     org_map = tower_settings.get('AUTH_LDAP_ORGANIZATION_MAP').get('value')
     current_settings['ldap_organization_map'] = transform_ldap_organization_map(org_map)
 
-
     team_map = tower_settings.get('AUTH_LDAP_TEAM_MAP').get('value')
     current_settings['ldap_team_map'] = transform_ldap_team_map(team_map)
-
-    current_settings['ldap_user_attr_map'] = tower_settings.get('AUTH_LDAP_USER_ATTR_MAP').get('value')
 
     module.tower_settings = tower_settings
     module.current_settings = current_settings
@@ -410,18 +419,18 @@ def transform_ldap_group_type(group_type):
         transformed_group_type = 'active_directory'
     # TODO: Find out what RHT Identity manager recommends for the group type setting since it
     # uses a form of OpenLDAP
-    elif group_type == 'NestedGroupOfNamesType':
-        transformed_group_type = 'open_ldap'
     # Converting from module format to Tower API
     elif group_type == 'active_directory':
         transformed_group_type = 'NestedActiveDirectoryGroupType'
     elif group_type == 'open_ldap':
         transformed_group_type = "NestedGroupOfNamesType"
+    elif group_type == 'freeipa':
+        transformed_group_type = "NestedMemberDNGroupType"
     else:
         transformed_group_type = 'MemberDNGroupType'
     return transformed_group_type
 
-def transform_ldap_group_search(group_search):
+def transform_ldap_group_search(group_search, ldap_server_type='active_directory'):
     results = []
     if isinstance(group_search, list):
         # From Tower API -> module data model
@@ -429,12 +438,18 @@ def transform_ldap_group_search(group_search):
             return group_search[0]
         # From module data model -> Tower API
     else:
+        group_search_str = ""
+        if ldap_server_type == 'active_directory':
+            group_search_str = '(objectClass=group)'
+        elif ldap_server_type == 'open_ldap' or ldap_server_type == 'freeipa':
+            group_search_str = '(objectClass=ipausergroup)'
+
         for _entry in group_search:
             results = [
                 group_search,
                 "SCOPE_SUBTREE",
-                '(objectClass=group)'
-            ]
+                group_search_str
+               ]
     return results
 
 def transform_ldap_user_search(users_search_list, ldap_server_type='active_directory'):
@@ -455,6 +470,8 @@ def transform_ldap_user_search(users_search_list, ldap_server_type='active_direc
                 user_search_str = '(sAMAccountname=%(user)s)'
             elif ldap_server_type == 'open_ldap':
                 user_search_str = '(cn=%(user)s)'
+            elif ldap_server_type == 'freeipa':
+                user_search_str = '(uid=%(user)s)'
             for _entry in users_search_list:
                 results.append(
                 [
@@ -539,8 +556,7 @@ def transform_ldap_team_map(team_map):
 
 
 def main():
-    argument_spec = tower_argument_spec()
-    argument_spec.update(dict(
+    argument_spec = dict(
         ldap_server_protocol=dict(type='str', default='ldaps' ),
         ldap_server_name=dict(type='str'),
         ldap_server_port=dict(type='int', default=636),
@@ -549,15 +565,15 @@ def main():
         ldap_start_tls=dict(type='bool', default=False),
         ldap_user_search=dict(type='list'),
         ldap_group_search=dict(type='str'),
-        ldap_group_type=dict(type='str', choices=['active_directory', 'open_ldap'],
+        ldap_group_type=dict(type='str', choices=['active_directory', 'open_ldap' ,'freeipa'],
                              default='active_directory'),
         ldap_superuser=dict(type='str'),
         ldap_organization_map=dict(type='list'),
         ldap_team_map=dict(type='list'),
         state=dict(type='str', choices=['present','absent'], default='present'),
         ldap_user_attr_map = transform_ldap_user_attr_map()
-    ))
-    module = AnsibleModule(argument_spec=argument_spec, supports_check_mode=True)
+    )
+    module = TowerModule(argument_spec=argument_spec, supports_check_mode=True)
     if not HAS_TOWER_CLI:
         module.fail_json(msg="ansible-tower-cli required for this module")
     tower_auth = tower_auth_config(module)
